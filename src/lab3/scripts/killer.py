@@ -75,7 +75,7 @@ class MinimalTurtleSpawner(Node):
 
     def kill_turtle(self):
         kill_request = Kill.Request()
-        kill_request.name = self.name1
+        kill_request.name = "/"+self.name1
         self.kill_turtle_client.call_async(kill_request)
 
     def turtle2_pose_callback(self, msg):
