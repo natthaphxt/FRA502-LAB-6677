@@ -250,16 +250,20 @@ class ControllerNode(Node):
                 self.get_logger().info(
                     f"Target reached. Error: {np.linalg.norm(error):.4f}"
                 )
-                self.req_scheduler("IDLE")
+                # --- [IMPORTANT FIX] Send FINISHED, not IDLE ---
+                self.req_scheduler("FINISHED")
                 self.controller_state = "IDLE"
                 return False
+
             q_target = self.solve_ik_robust(p_setpoint[0], p_setpoint[1], p_setpoint[2])
 
             if q_target is None:
                 self.get_logger().warn("Target became unreachable during move")
-                self.req_scheduler("IDLE")
+                # If target is bad, ask for a new one (FINISHED), don't stop (IDLE)
+                self.req_scheduler("FINISHED")
                 self.controller_state = "IDLE"
                 return False
+
             self.q = self.q + 0.2 * (q_target - self.q)
             self.publish_joint_state(self.q)
             return True
@@ -300,7 +304,6 @@ class ControllerNode(Node):
         )
         self.endeff_pub.publish(endeff)
 
-
     def timer_callback(self):
         if not hasattr(self, "initialized"):
             self.initialized = False
@@ -317,7 +320,9 @@ class ControllerNode(Node):
             if self.auto_start_time and (
                 time.time() - self.auto_start_time > self.auto_timeout
             ):
-                self.req_scheduler("IDLE")
+                self.get_logger().warn("Auto move timed out, requesting next.")
+                # Timeout -> ask for next target
+                self.req_scheduler("FINISHED")
                 self.controller_state = "IDLE"
                 return
             if not self.control_to_pos(self.random_setpoint):
@@ -331,9 +336,9 @@ class ControllerNode(Node):
 
         elif "TELEOP" in self.controller_state:
             self.control_vel(self.controller_state)
-            self.rviz_pub(curr_pos) 
+            self.rviz_pub(curr_pos)
 
-        else: 
+        else:
             self.rviz_pub(curr_pos)
 
 

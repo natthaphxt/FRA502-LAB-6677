@@ -37,12 +37,13 @@ class RobotSchedulerNode(Node):
         # AUTO mode management
         self.auto_mode_active = False
         self.auto_cycle_count = 0
-        self.max_auto_cycles = 100  # Prevent infinite loops
+        self.max_auto_cycles = 100
 
         # Safety parameters
         self.emergency_stop_active = False
-        self.state_timeout = 30.0  # Maximum time in any state except IDLE
+        self.state_timeout = 30.0
         self.state_start_time = time.time()
+        self.cycle_timer = None  # Timer for next cycle
 
         # Publishers
         self.state_publisher = self.create_publisher(String, "/current_state", 10)
@@ -53,82 +54,74 @@ class RobotSchedulerNode(Node):
             Scheduler, "robot_state_server", self.scheduler_service_callback
         )
 
-        # Service clients for coordination
+        # Service clients
         self.controller_client = self.create_client(Controller, "controller_server")
         self.random_client = self.create_client(Random, "random_pose")
 
         # Timers
-        self.create_timer(0.1, self.state_publish_callback)  # Publish state at 10Hz
-        self.create_timer(
-            1.0, self.state_monitor_callback
-        )  # Monitor state health at 1Hz
-        self.create_timer(5.0, self.status_report_callback)  # Status report at 0.2Hz
+        self.create_timer(0.1, self.state_publish_callback)
+        self.create_timer(1.0, self.state_monitor_callback)
+        self.create_timer(5.0, self.status_report_callback)
 
-        # Subscribers for safety monitoring
         self.create_subscription(
             String, "/singularity_warning", self.singularity_warning_callback, 10
         )
 
-        # Initialize state
-        self.get_logger().info("Robot Scheduler Node initialized")
-        self.get_logger().info(f"Initial state: {self.current_state.value}")
+        self.get_logger().info("Robot Scheduler Node initialized (Fixed Loop Logic)")
         self.publish_state()
 
-    def scheduler_service_callback(
-        self, request: Scheduler.Request, response: Scheduler.Response
-    ):
-        """Handle state change requests"""
+    def scheduler_service_callback(self, request, response):
         requested_state = request.state.data.upper()
+
+        # [FIX] Handle FINISHED signal from controller
+        if requested_state == "FINISHED":
+            if self.current_state == RobotState.AUTO and self.auto_mode_active:
+                self.get_logger().info("Task finished. Next cycle in 1s...")
+                # ใช้ Timer รอ 1 วินาทีแล้วเริ่มรอบใหม่ (ไม่เปลี่ยนเป็น IDLE เพื่อรักษา auto_mode_active)
+                if self.cycle_timer:
+                    self.cycle_timer.cancel()
+                self.cycle_timer = self.create_timer(1.0, self.trigger_next_cycle)
+            else:
+                self.change_state("IDLE")
+
+            response.success = True
+            return response
 
         self.get_logger().info(
             f"State change request: {self.current_state.value} -> {requested_state}"
         )
 
-        # Check if state transition is valid
         if self.validate_state_transition(requested_state):
             success = self.change_state(requested_state)
             response.success = success
-
-            if success:
-                self.get_logger().info(f"State changed to: {self.current_state.value}")
-            else:
-                self.get_logger().warning(
-                    f"Failed to change state to: {requested_state}"
-                )
         else:
             response.success = False
-            self.get_logger().warning(
-                f"Invalid state transition: {self.current_state.value} -> {requested_state}"
-            )
+            self.get_logger().warning(f"Invalid transition: {requested_state}")
 
         return response
 
+    def trigger_next_cycle(self):
+        """Trigger next auto cycle"""
+        if self.cycle_timer:
+            self.cycle_timer.cancel()
+            self.cycle_timer = None
+
+        if self.current_state == RobotState.AUTO and self.auto_mode_active:
+            self.request_random_position()
+
     def validate_state_transition(self, new_state: str) -> bool:
-        """Validate if state transition is allowed"""
-        # Convert string to RobotState
         try:
             new_state_enum = RobotState(new_state)
         except ValueError:
-            self.get_logger().error(f"Unknown state: {new_state}")
             return False
 
-        # Emergency stop can be activated from any state
         if new_state_enum == RobotState.EMERGENCY_STOP:
             return True
-
-        # Cannot transition if emergency stop is active
         if self.emergency_stop_active:
-            self.get_logger().warning(
-                "Cannot change state while emergency stop is active"
-            )
             return False
-
-        # Cannot transition if another transition is in progress
         if self.transition_in_progress:
-            self.get_logger().warning("Another state transition is in progress")
             return False
 
-        # Define valid transitions
         valid_transitions = {
             RobotState.IDLE: [
                 RobotState.IK,
@@ -150,251 +143,150 @@ class RobotSchedulerNode(Node):
             RobotState.AUTO: [
                 RobotState.IDLE,
                 RobotState.EMERGENCY_STOP,
-                RobotState.AUTO,  # Allow AUTO to AUTO for continuous operation
+                RobotState.AUTO,
             ],
             RobotState.EMERGENCY_STOP: [RobotState.IDLE],
         }
 
-        # Check if transition is valid
         if new_state_enum in valid_transitions.get(self.current_state, []):
             return True
-
-        # Allow transition to same state (refresh)
         if new_state_enum == self.current_state:
             return True
-
         return False
 
     def change_state(self, new_state: str) -> bool:
-        """Execute state change"""
         try:
             with self.state_lock:
                 self.transition_in_progress = True
-
-                # Store previous state
                 self.previous_state = self.current_state
-
-                # Convert string to enum
                 new_state_enum = RobotState(new_state)
 
-                # Execute state exit actions
                 self.on_state_exit(self.current_state)
-
-                # Change state
                 self.current_state = new_state_enum
                 self.state_start_time = time.time()
-
-                # Add to history
                 self.add_to_history(new_state_enum)
-
-                # Execute state entry actions
                 self.on_state_enter(new_state_enum)
-
-                # Publish new state
                 self.publish_state()
 
                 self.transition_in_progress = False
                 return True
-
         except Exception as e:
             self.get_logger().error(f"Error during state change: {e}")
             self.transition_in_progress = False
             return False
 
     def on_state_exit(self, state: RobotState):
-        """Execute actions when exiting a state"""
-        self.get_logger().debug(f"Exiting state: {state.value}")
-
         if state == RobotState.AUTO:
             self.auto_mode_active = False
             self.auto_cycle_count = 0
+            if self.cycle_timer:
+                self.cycle_timer.cancel()
         elif state == RobotState.EMERGENCY_STOP:
             self.emergency_stop_active = False
 
     def on_state_enter(self, state: RobotState):
-        """Execute actions when entering a state"""
-        self.get_logger().debug(f"Entering state: {state.value}")
-
         if state == RobotState.AUTO:
             self.auto_mode_active = True
             self.auto_cycle_count = 0
-            # Request first random position
             self.request_random_position()
         elif state == RobotState.EMERGENCY_STOP:
             self.emergency_stop_active = True
             self.send_stop_command()
         elif state == RobotState.IDLE:
-            # Reset any active modes
             self.auto_mode_active = False
             self.emergency_stop_active = False
 
     def request_random_position(self):
-        """Request a random position for AUTO mode"""
         if not self.random_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warning("Random pose service not available")
             return
-
         request = Random.Request()
         request.mode.data = "AUTO"
-
         future = self.random_client.call_async(request)
         future.add_done_callback(self.random_position_callback)
 
     def random_position_callback(self, future):
-        """Handle random position response"""
         try:
             response = future.result()
             if response.inprogress:
                 self.auto_cycle_count += 1
                 self.get_logger().info(
-                    f"AUTO mode cycle {self.auto_cycle_count}: "
-                    f"Target ({response.position.x:.3f}, "
-                    f"{response.position.y:.3f}, {response.position.z:.3f})"
+                    f"AUTO mode cycle {self.auto_cycle_count}: Target ({response.position.x:.3f}, {response.position.y:.3f}, {response.position.z:.3f})"
                 )
 
-                # Check if we've reached max cycles
+                # [FIX] ส่งคำสั่งไป Controller (ของเดิมหายไป)
+                self.send_to_controller(response.position)
+
                 if self.auto_cycle_count >= self.max_auto_cycles:
-                    self.get_logger().warning(
-                        "Maximum AUTO cycles reached, switching to IDLE"
-                    )
                     self.change_state(RobotState.IDLE.value)
             else:
                 self.get_logger().warning("Failed to get random position")
-
         except Exception as e:
             self.get_logger().error(f"Random position callback error: {e}")
 
-    def send_stop_command(self):
-        """Send stop command to controller"""
+    # [ADD] ฟังก์ชันส่งคำสั่งที่หายไป
+    def send_to_controller(self, pos):
         if not self.controller_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warning(
-                "Controller service not available for stop command"
-            )
+            self.get_logger().warning("Controller service not available")
             return
+        req = Controller.Request()
+        req.mode.data = "AUTO"
+        req.position = pos
+        self.controller_client.call_async(req)
 
+    def send_stop_command(self):
+        if not self.controller_client.wait_for_service(timeout_sec=1.0):
+            return
         request = Controller.Request()
         request.mode.data = "IDLE"
-        request.position.x = 0.0
-        request.position.y = 0.0
-        request.position.z = 0.0
+        self.controller_client.call_async(request)
 
-        future = self.controller_client.call_async(request)
-        self.get_logger().info("Emergency stop command sent to controller")
-
-    def singularity_warning_callback(self, msg: String):
-        """Handle singularity warnings"""
-        self.get_logger().warning(f"Singularity warning received: {msg.data}")
-
-        # If in a movement mode, consider switching to IDLE for safety
+    def singularity_warning_callback(self, msg):
+        self.get_logger().warning(f"Singularity warning: {msg.data}")
         if self.current_state in [
             RobotState.TELEOP_F,
             RobotState.TELEOP_G,
             RobotState.AUTO,
         ]:
-            self.get_logger().warning(
-                "Singularity detected, switching to IDLE for safety"
-            )
             self.change_state(RobotState.IDLE.value)
 
     def state_publish_callback(self):
-        """Periodically publish current state"""
         self.publish_state()
 
     def state_monitor_callback(self):
-        """Monitor state health and timeouts"""
         if self.current_state == RobotState.IDLE:
-            return  # No timeout for IDLE
-
-        # Check for state timeout
+            return
         time_in_state = time.time() - self.state_start_time
-
-        if time_in_state > self.state_timeout and self.current_state != RobotState.IDLE:
-            self.get_logger().warning(
-                f"State timeout: {self.current_state.value} "
-                f"({time_in_state:.1f}s > {self.state_timeout}s)"
-            )
-
-            # AUTO mode gets special handling for continuous operation
+        if time_in_state > self.state_timeout:
+            self.get_logger().warning(f"State timeout: {self.current_state.value}")
             if self.current_state == RobotState.AUTO and self.auto_mode_active:
-                # Request new position instead of switching to IDLE
-                self.get_logger().info("AUTO mode timeout, requesting new position")
                 self.request_random_position()
-                self.state_start_time = time.time()  # Reset timer
+                self.state_start_time = time.time()
             else:
                 self.change_state(RobotState.IDLE.value)
 
     def status_report_callback(self):
-        """Publish detailed status report"""
-        status_msg = String()
-
-        time_in_state = time.time() - self.state_start_time
-
-        status_data = {
-            "current_state": self.current_state.value,
-            "previous_state": self.previous_state.value,
-            "time_in_state": f"{time_in_state:.1f}s",
-            "auto_cycles": self.auto_cycle_count if self.auto_mode_active else 0,
-            "emergency_stop": self.emergency_stop_active,
-            "transition_in_progress": self.transition_in_progress,
-        }
-
-        status_msg.data = str(status_data)
-        self.status_publisher.publish(status_msg)
+        pass
 
     def publish_state(self):
-        """Publish current state"""
         msg = String()
         msg.data = self.current_state.value
         self.state_publisher.publish(msg)
 
     def add_to_history(self, state: RobotState):
-        """Add state to history"""
         timestamp = time.time()
-        self.state_history.append(
-            {
-                "state": state.value,
-                "timestamp": timestamp,
-                "time_str": time.strftime("%H:%M:%S", time.localtime(timestamp)),
-            }
-        )
-
-        # Limit history size
+        self.state_history.append({"state": state.value, "timestamp": timestamp})
         if len(self.state_history) > self.max_history_size:
             self.state_history.pop(0)
-
-    def get_state_history(self):
-        """Get state history for debugging"""
-        return self.state_history
-
-    def emergency_stop(self):
-        """Trigger emergency stop"""
-        self.get_logger().warning("EMERGENCY STOP ACTIVATED")
-        self.change_state(RobotState.EMERGENCY_STOP.value)
-
-    def reset(self):
-        """Reset scheduler to initial state"""
-        self.get_logger().info("Resetting scheduler to IDLE")
-        with self.state_lock:
-            self.current_state = RobotState.IDLE
-            self.previous_state = RobotState.IDLE
-            self.auto_mode_active = False
-            self.auto_cycle_count = 0
-            self.emergency_stop_active = False
-            self.transition_in_progress = False
-            self.state_start_time = time.time()
-            self.state_history.clear()
-
-        self.publish_state()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = RobotSchedulerNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Scheduler shutdown requested")
+        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()

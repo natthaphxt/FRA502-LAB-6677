@@ -2,46 +2,28 @@
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped, Header
-from std_msgs.msg import String
-from r_interfaces.srv import Scheduler, Random, Controller
+
+# --- [จุดที่แก้สำคัญมาก] ---
+from std_msgs.msg import Header  # <--- Header ต้องมาจาก std_msgs
+from geometry_msgs.msg import PoseStamped  # <--- PoseStamped มาจาก geometry_msgs
+from r_interfaces.srv import Random  # <--- Interface ของคุณ
+
+# Logic imports
 import random
 import numpy as np
 import roboticstoolbox as rtb
+from spatialmath import SE3, UnitQuaternion
 from math import pi
-from spatialmath import SE3
 
 
-class RandomNode(Node):
+class RandomServiceNode(Node):
     def __init__(self):
-        super().__init__("random_node")
+        super().__init__("random_node")  # ชื่อ Node ที่จะโชว์ใน list
 
-        self.declare_parameter("frequency", 10.0)
-        self.frequency = (
-            self.get_parameter("frequency").get_parameter_value().double_value
-        )
-        self.create_timer(1 / self.frequency, self.timer_callback)
+        self.srv = self.create_service(Random, "random_pose", self.random_callback)
         self.target_pub = self.create_publisher(PoseStamped, "/target", 10)
-        self.create_subscription(
-            String, "/current_state", self.current_state_callback, 10
-        )
-        self.scheduler_client = self.create_client(Scheduler, "robot_state_server")
-        self.controller_client = self.create_client(Controller, "controller_server")
-        self.random_server = self.create_service(
-            Random, "random_pose", self.random_server_callback
-        )
 
-        self.r_max = 0.55  # Adjusted for new model
-        self.r_min = 0.10
-        self.l = 0.2
-        self.z_min = 0.25
-        self.z_max = 0.55
-        self.ground_clearance = 0.05
-
-        self.current_state = "IDLE"
-        self.auto_mode_active = False
-
-        # === FIX: Updated DH Parameters to match Xacro offsets ===
+        # --- ROBOT DEFINITION ---
         self.robot = rtb.DHRobot(
             [
                 rtb.RevoluteMDH(alpha=0.0, a=0.0, d=0.2, offset=0.0),
@@ -51,126 +33,71 @@ class RandomNode(Node):
             tool=SE3.Tx(0.28),
             name="RRR_Robot",
         )
-        # ==========================================================
 
-        self.get_logger().info("Random Node Started (Corrected Model).")
+        self.get_logger().info("Random Node Ready.")
 
-    def check_singularity(self, q):
-        try:
-            J = self.robot.jacob0(q)
-            det_J = np.linalg.det(J[0:3, :])
-            return abs(det_J) >= 3e-3
-        except:
-            return False
+    def random_callback(self, request, response):
+        if request.mode.data != "AUTO":
+            response.success = False
+            return response
 
-    def check_full_robot_clearance(self, q):
-        try:
-            min_safe_z = self.ground_clearance
-            T2 = self.robot.fkine([q[0], q[1], 0])
-            if T2.t[2] < min_safe_z:
-                return (False, 0, "link2")
-            T3 = self.robot.fkine(q)
-            if T3.t[2] < min_safe_z:
-                return (False, 0, "end")
-            return (True, 1.0, None)
-        except:
-            return (False, 0.0, "error")
+        # --- LOGIC สุ่มแบบ FK ---
+        valid_pose = False
+        limit_check_count = 0
 
-    def verify_ik_solution(self, x, y, z):
-        try:
-            T = SE3(x, y, z)
-            # Try safe seed
-            ik = self.robot.ikine_LM(T, mask=[1, 1, 1, 0, 0, 0], q0=[0, 0.5, 0.5])
-            if ik.success:
-                is_safe, _, _ = self.check_full_robot_clearance(ik.q)
-                if is_safe and self.check_singularity(ik.q):
-                    return (ik.q, 1.0)
-            return None
-        except:
-            return None
+        while not valid_pose:
+            limit_check_count += 1
+            if limit_check_count > 1000:
+                break
 
-    def generate_random_position(self):
-        for _ in range(200):
-            theta = random.uniform(0, 2 * pi)
-            phi = random.uniform(0, pi / 2)  # Upper hemisphere
-            r = random.uniform(self.r_min, self.r_max)
+            q_rand = [
+                random.uniform(-np.pi, np.pi),
+                random.uniform(-np.pi, np.pi),
+                random.uniform(-np.pi, np.pi),
+            ]
 
-            x = r * np.cos(phi) * np.cos(theta)
-            y = r * np.cos(phi) * np.sin(theta)
-            z = self.l + r * np.sin(phi)
+            T_rand = self.robot.fkine(q_rand)
+            x, y, z = T_rand.t[0], T_rand.t[1], T_rand.t[2]
 
-            if z < self.z_min or z > self.z_max:
-                continue
+            dist_sq = x**2 + y**2 + (z - 0.2) ** 2
+            if 0.15**2 <= dist_sq <= 0.55**2:
+                if z >= 0.10:
+                    valid_pose = True
 
-            if self.verify_ik_solution(x, y, z) is not None:
-                self.get_logger().info(f"Generated: ({x:.2f}, {y:.2f}, {z:.2f})")
-                return [x, y, z]
-
-        return [0.2, 0.0, 0.45]  # Safe fallback
-
-    def publish_target(self, position):
+        # --- PUBLISH TARGET ---
         msg = PoseStamped()
-        msg.header = Header()
+        msg.header = Header()  # ใช้ Header ที่ถูกต้อง
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "link_0"
-        msg.pose.position.x = float(position[0])
-        msg.pose.position.y = float(position[1])
-        msg.pose.position.z = float(position[2])
-        msg.pose.orientation.w = 1.0
+        msg.pose.position.x = float(x)
+        msg.pose.position.y = float(y)
+        msg.pose.position.z = float(z)
+
+        quat = UnitQuaternion(T_rand.R)
+        msg.pose.orientation.w = float(quat.s)
+        msg.pose.orientation.x = float(quat.v[0])
+        msg.pose.orientation.y = float(quat.v[1])
+        msg.pose.orientation.z = float(quat.v[2])
+
         self.target_pub.publish(msg)
 
-    def random_server_callback(
-        self, request: Random.Request, response: Random.Response
-    ):
-        if request.mode.data == "AUTO":
-            position = self.generate_random_position()
-            response.position.x = float(position[0])
-            response.position.y = float(position[1])
-            response.position.z = float(position[2])
-            response.inprogress = True
-            self.publish_target(position)
-            self.send_auto_command(position)
-            self.auto_mode_active = True
+        # --- SERVICE RESPONSE ---
+        response.position.x = float(x)
+        response.position.y = float(y)
+        response.position.z = float(z)
+        response.inprogress = True
+        # response.success = True
+
+        self.get_logger().info(f"Generated Target: [{x:.3f}, {y:.3f}, {z:.3f}]")
         return response
-
-    def send_auto_command(self, position):
-        if not self.controller_client.wait_for_service(timeout_sec=1.0):
-            return
-        req = Controller.Request()
-        req.mode.data = "AUTO"
-        req.position.x, req.position.y, req.position.z = (
-            position[0],
-            position[1],
-            position[2],
-        )
-        self.controller_client.call_async(req)
-
-    def current_state_callback(self, msg):
-        old_state = self.current_state
-        self.current_state = msg.data
-        if (
-            self.auto_mode_active
-            and old_state == "AUTO"
-            and self.current_state == "IDLE"
-        ):
-            pos = self.generate_random_position()
-            self.publish_target(pos)
-            self.send_auto_command(pos)
-
-    def timer_callback(self):
-        pass
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = RandomNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    node = RandomServiceNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == "__main__":
