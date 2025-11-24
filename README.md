@@ -55,11 +55,7 @@ cd FRA502-LAB-6677
 colcon build
 source install/setup.bash
 ```
-**Set up your environment by sourcing the following file.**
 
-```bash
-echo "source ~/FRA502-LAB-6677/install/setup.bash" >> ~/.bashrc
-```
 
 ## How to Run
 
@@ -68,6 +64,12 @@ echo "source ~/FRA502-LAB-6677/install/setup.bash" >> ~/.bashrc
 Open a terminal and run:
 ```bash
 ros2 launch example_description robot_control.launch.py
+```
+If cannot run you must dom this before and used upper command:
+```bash
+cd FRA502-LAB-6677
+colcon build
+source install/setup.bash
 ```
 
 **This will start:**
@@ -85,7 +87,12 @@ Open a **NEW terminal** and run:
 ```bash
 ros2 run example_description teleop.py
 ```
-
+If cannot run you must dom this before and used upper command:
+```bash
+cd FRA502-LAB-6677
+colcon build
+source install/setup.bash
+```
 You should see the control menu:
 ```
 ---------------------------
