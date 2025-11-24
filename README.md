@@ -278,6 +278,8 @@ ros2 topic echo /singularity_warning
 # Test IK service manually
 ros2 service call /controller_server r_interfaces/srv/Controller "{mode: {data: 'IK'}, position: {x: 0.3, y: 0.0, z: 0.35}}"
 
+# Test Auto mode
+ros2 service call /robot_state_server r_interfaces/srv/Scheduler "{state: {data: 'AUTO'}}"
 ```
 
 ## Find Workspace 
