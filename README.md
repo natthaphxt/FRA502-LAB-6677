@@ -58,7 +58,7 @@ source install/setup.bash
 **Set up your environment by sourcing the following file.**
 
 ```bash
-echo "source ~/FUN4/install/setup.bash" >> ~/.bashrc
+echo "source ~/FRA502-LAB-6677/install/setup.bash" >> ~/.bashrc
 ```
 
 ## How to Run
