@@ -9,37 +9,17 @@ This project implements a complete control system for a 3-DOF robotic arm with t
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         User Interface                           │
-│                    (teleop.py - Terminal)                        │
-└────────────────────────────┬────────────────────────────────────┘
-                             │ Controller Service
-                             ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                    scheduler.py (State Manager)                  │
-│  • Validates state transitions                                   │
-│  • Publishes /current_state                                      │
-│  • Monitors system health                                        │
-└─────────────┬───────────────────────────────────┬────────────────┘
-              │                                   │
-              ↓                                   ↓
-┌──────────────────────────┐      ┌──────────────────────────────┐
-│   controller.py          │      │   random_target.py           │
-│   • IK solver            │      │   • Workspace analysis       │
-│   • Velocity control     │      │   • Random position gen      │
-│   • Singularity detect   │      │   • IK verification          │
-│   • Joint state publish  │      │   • Target validation        │
-└──────────────────────────┘      └──────────────────────────────┘
-              │
-              ↓
-┌──────────────────────────────────────────────────────────────────┐
-│              robot_state_publisher + RVIZ2                        │
-│              (Visualization & TF Management)                      │
-└──────────────────────────────────────────────────────────────────┘
-```
+![System Architecture](System_AR.png)
+
 
 ### Node Communication
+
+**Node:**
+- `controller_node`     - Handles the core mathematics and motion execution.
+- `scheduler_node`      - Acts as a Finite State Machine (FSM) to manage the robot's operating modes.
+- `teleop_node`         - A keyboard interface for the user.
+- `random_target_node`  - Used specifically for the AUTO mode.
+- `work_space.py`       - Find Workspace of Robot
 
 **Topics:**
 - `/current_state` (String) - Current robot state (IDLE/IK/TELEOP_G/TELEOP_F/AUTO)
@@ -56,16 +36,29 @@ This project implements a complete control system for a 3-DOF robotic arm with t
 
 ## Installation
 
-1. **Clone this github to your workspace:**
+[Install ROS 2 packages](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html)
+
+**Install dependencies**
+
 ```bash
-git clone https://github.com/natthaphxt/FRA502-LAB-6677.git
+pip3 install roboticstoolbox-python
 ```
 
-2. **Build the workspace:**
+**Go somewhere like your home directory and clone this package.**
+
 ```bash
-cd ~/LAB4_ws
+git clone -b LAB4 https://github.com/natthaphxt/FRA502-LAB-6677.git
+```
+**then build ros2 workspace**
+```bash
+cd FRA502-LAB-6677
 colcon build
 source install/setup.bash
+```
+**Set up your environment by sourcing the following file.**
+
+```bash
+echo "source ~/FUN4/install/setup.bash" >> ~/.bashrc
 ```
 
 ## How to Run
@@ -277,29 +270,13 @@ ros2 topic echo /singularity_warning
 
 # Test IK service manually
 ros2 service call /controller_server r_interfaces/srv/Controller "{mode: {data: 'IK'}, position: {x: 0.3, y: 0.0, z: 0.35}}"
+
 ```
 
-## Technical Specifications
+## Find Workspace 
+Open a NEW terminal and run:
+```bash
+ros2 run example_description work_space.py
+```
+![Robot Workspace](ws.png)
 
-### Robot Parameters
-- **Type:** 3-DOF RRR (Revolute-Revolute-Revolute)
-- **DH Parameters:**
-  - Link 1: d=0.20m, a=0.00m, α=0°
-  - Link 2: d=0.02m, a=0.00m, α=90°
-  - Link 3: d=0.00m, a=0.25m, α=0°
-  - Tool: 0.28m extension
-
-### Workspace
-- **Radial Range:** 0.12m - 0.48m from base
-- **Height Range:** 0.28m - 0.50m above ground
-- **Type:** Upper hemisphere (above base plane)
-- **Singularities Avoided:** Center axis, full extension
-
-### Control Parameters
-- **Control Frequency:** 50 Hz
-- **Teleop Speed Range:** 0.01 - 0.50 m/s
-- **Default Speed:** 0.10 m/s
-- **Singularity Threshold:** det(J) < 1e-3
-- **Position Tolerance:** 0.001m
-- **AUTO Timeout:** 10 seconds
-- **Ground Clearance:** 0.05m minimum
