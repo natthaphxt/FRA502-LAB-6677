@@ -43,7 +43,7 @@ class RobotSchedulerNode(Node):
         self.emergency_stop_active = False
         self.state_timeout = 30.0
         self.state_start_time = time.time()
-        self.cycle_timer = None  # Timer for next cycle
+        self.cycle_timer = None
 
         # Publishers
         self.state_publisher = self.create_publisher(String, "/current_state", 10)
@@ -67,21 +67,21 @@ class RobotSchedulerNode(Node):
             String, "/singularity_warning", self.singularity_warning_callback, 10
         )
 
-        self.get_logger().info("Robot Scheduler Node initialized (Fixed Loop Logic)")
+        self.get_logger().info("Robot Scheduler Node initialized")
         self.publish_state()
 
     def scheduler_service_callback(self, request, response):
         requested_state = request.state.data.upper()
 
-        # [FIX] Handle FINISHED signal from controller
+        # Handle FINISHED signal from controller
         if requested_state == "FINISHED":
             if self.current_state == RobotState.AUTO and self.auto_mode_active:
                 self.get_logger().info("Task finished. Next cycle in 1s...")
-                # ใช้ Timer รอ 1 วินาทีแล้วเริ่มรอบใหม่ (ไม่เปลี่ยนเป็น IDLE เพื่อรักษา auto_mode_active)
                 if self.cycle_timer:
                     self.cycle_timer.cancel()
                 self.cycle_timer = self.create_timer(1.0, self.trigger_next_cycle)
             else:
+                # Not in AUTO mode, just go to IDLE
                 self.change_state("IDLE")
 
             response.success = True
@@ -96,7 +96,9 @@ class RobotSchedulerNode(Node):
             response.success = success
         else:
             response.success = False
-            self.get_logger().warning(f"Invalid transition: {requested_state}")
+            self.get_logger().warning(
+                f"Invalid transition: {self.current_state.value} -> {requested_state}"
+            )
 
         return response
 
@@ -117,7 +119,7 @@ class RobotSchedulerNode(Node):
 
         if new_state_enum == RobotState.EMERGENCY_STOP:
             return True
-        if self.emergency_stop_active:
+        if self.emergency_stop_active and new_state_enum != RobotState.IDLE:
             return False
         if self.transition_in_progress:
             return False
@@ -129,21 +131,33 @@ class RobotSchedulerNode(Node):
                 RobotState.TELEOP_G,
                 RobotState.AUTO,
             ],
-            RobotState.IK: [RobotState.IDLE, RobotState.EMERGENCY_STOP],
+            RobotState.IK: [
+                RobotState.IDLE,
+                RobotState.TELEOP_F,
+                RobotState.TELEOP_G,
+                RobotState.AUTO,
+                RobotState.EMERGENCY_STOP,
+            ],
             RobotState.TELEOP_F: [
                 RobotState.IDLE,
                 RobotState.TELEOP_G,
+                RobotState.IK,
+                RobotState.AUTO,
                 RobotState.EMERGENCY_STOP,
             ],
             RobotState.TELEOP_G: [
                 RobotState.IDLE,
                 RobotState.TELEOP_F,
+                RobotState.IK,
+                RobotState.AUTO,
                 RobotState.EMERGENCY_STOP,
             ],
             RobotState.AUTO: [
                 RobotState.IDLE,
+                RobotState.IK,
+                RobotState.TELEOP_F,
+                RobotState.TELEOP_G,
                 RobotState.EMERGENCY_STOP,
-                RobotState.AUTO,
             ],
             RobotState.EMERGENCY_STOP: [RobotState.IDLE],
         }
@@ -176,104 +190,164 @@ class RobotSchedulerNode(Node):
             return False
 
     def on_state_exit(self, state: RobotState):
+        """Clean up when exiting a state"""
         if state == RobotState.AUTO:
             self.auto_mode_active = False
             self.auto_cycle_count = 0
             if self.cycle_timer:
                 self.cycle_timer.cancel()
+                self.cycle_timer = None
+            self.get_logger().info("Exiting AUTO mode")
         elif state == RobotState.EMERGENCY_STOP:
             self.emergency_stop_active = False
 
     def on_state_enter(self, state: RobotState):
+        """Initialize when entering a state"""
         if state == RobotState.AUTO:
             self.auto_mode_active = True
             self.auto_cycle_count = 0
+            self.get_logger().info("Entering AUTO mode")
             self.request_random_position()
+
         elif state == RobotState.EMERGENCY_STOP:
             self.emergency_stop_active = True
-            self.send_stop_command()
+            self.send_controller_mode("IDLE")
+
         elif state == RobotState.IDLE:
             self.auto_mode_active = False
             self.emergency_stop_active = False
+            self.send_controller_mode("IDLE")
+
+        elif state in [RobotState.TELEOP_F, RobotState.TELEOP_G]:
+            # Forward TELEOP mode to controller
+            self.send_controller_mode(state.value)
+
+        elif state == RobotState.IK:
+            # Forward IK mode to controller (position will be sent separately by teleop)
+            self.send_controller_mode("IK")
+
+    def send_controller_mode(self, mode, position=None):
+        """Send mode change to controller"""
+        if not self.controller_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warning("Controller service not available")
+            return
+
+        request = Controller.Request()
+        request.mode.data = mode
+
+        if position:
+            request.position.x = float(position.x)
+            request.position.y = float(position.y)
+            request.position.z = float(position.z)
+        else:
+            request.position.x = 0.0
+            request.position.y = 0.0
+            request.position.z = 0.0
+
+        future = self.controller_client.call_async(request)
+        future.add_done_callback(self.controller_mode_callback)
+
+    def controller_mode_callback(self, future):
+        """Handle controller mode change response"""
+        try:
+            response = future.result()
+            if response.inprogress:
+                self.get_logger().debug("Controller mode change accepted")
+            else:
+                self.get_logger().warning("Controller mode change rejected")
+        except Exception as e:
+            self.get_logger().error(f"Controller service error: {e}")
 
     def request_random_position(self):
+        """Request random target from random_pose service"""
+        if not self.auto_mode_active:
+            return
+
         if not self.random_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warning("Random pose service not available")
             return
+
         request = Random.Request()
         request.mode.data = "AUTO"
         future = self.random_client.call_async(request)
         future.add_done_callback(self.random_position_callback)
 
     def random_position_callback(self, future):
+        """Handle random position response"""
         try:
             response = future.result()
             if response.inprogress:
                 self.auto_cycle_count += 1
                 self.get_logger().info(
-                    f"AUTO mode cycle {self.auto_cycle_count}: Target ({response.position.x:.3f}, {response.position.y:.3f}, {response.position.z:.3f})"
+                    f"AUTO cycle {self.auto_cycle_count}: Target ({response.position.x:.3f}, {response.position.y:.3f}, {response.position.z:.3f})"
                 )
-
-                # [FIX] ส่งคำสั่งไป Controller (ของเดิมหายไป)
-                self.send_to_controller(response.position)
+                # Send target to controller
+                self.send_controller_auto_target(response.position)
 
                 if self.auto_cycle_count >= self.max_auto_cycles:
+                    self.get_logger().info("Max AUTO cycles reached, stopping")
                     self.change_state(RobotState.IDLE.value)
             else:
                 self.get_logger().warning("Failed to get random position")
         except Exception as e:
             self.get_logger().error(f"Random position callback error: {e}")
 
-    # [ADD] ฟังก์ชันส่งคำสั่งที่หายไป
-    def send_to_controller(self, pos):
+    def send_controller_auto_target(self, position):
+        """Send AUTO target to controller"""
         if not self.controller_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warning("Controller service not available")
             return
-        req = Controller.Request()
-        req.mode.data = "AUTO"
-        req.position = pos
-        self.controller_client.call_async(req)
 
-    def send_stop_command(self):
-        if not self.controller_client.wait_for_service(timeout_sec=1.0):
-            return
         request = Controller.Request()
-        request.mode.data = "IDLE"
+        request.mode.data = "AUTO"
+        request.position = position
         self.controller_client.call_async(request)
 
     def singularity_warning_callback(self, msg):
-        self.get_logger().warning(f"Singularity warning: {msg.data}")
-        if self.current_state in [
-            RobotState.TELEOP_F,
-            RobotState.TELEOP_G,
-            RobotState.AUTO,
-        ]:
-            self.change_state(RobotState.IDLE.value)
+        """Handle singularity warning - only stop on SEVERE"""
+        # Only stop on SEVERE singularity (message starts with "SEVERE:")
+        if msg.data.startswith("SEVERE:"):
+            self.get_logger().error(f"SEVERE singularity detected: {msg.data}")
+            if self.current_state in [RobotState.TELEOP_F, RobotState.TELEOP_G]:
+                self.get_logger().warning("Emergency stop due to SEVERE singularity!")
+                self.change_state(RobotState.IDLE.value)
+        else:
+            # Just log warnings, don't stop
+            self.get_logger().warning(f"Singularity warning (non-critical): {msg.data}")
 
     def state_publish_callback(self):
+        """Periodically publish current state"""
         self.publish_state()
 
     def state_monitor_callback(self):
+        """Monitor for state timeouts"""
         if self.current_state == RobotState.IDLE:
             return
+
         time_in_state = time.time() - self.state_start_time
         if time_in_state > self.state_timeout:
-            self.get_logger().warning(f"State timeout: {self.current_state.value}")
+            self.get_logger().warning(f"State timeout in {self.current_state.value}")
             if self.current_state == RobotState.AUTO and self.auto_mode_active:
+                # Request next target on timeout
                 self.request_random_position()
                 self.state_start_time = time.time()
             else:
                 self.change_state(RobotState.IDLE.value)
 
     def status_report_callback(self):
-        pass
+        """Periodic status report"""
+        status_msg = String()
+        status_msg.data = f"State: {self.current_state.value}, Auto: {self.auto_mode_active}, Cycles: {self.auto_cycle_count}"
+        self.status_publisher.publish(status_msg)
 
     def publish_state(self):
+        """Publish current state"""
         msg = String()
         msg.data = self.current_state.value
         self.state_publisher.publish(msg)
 
     def add_to_history(self, state: RobotState):
+        """Add state to history"""
         timestamp = time.time()
         self.state_history.append({"state": state.value, "timestamp": timestamp})
         if len(self.state_history) > self.max_history_size:

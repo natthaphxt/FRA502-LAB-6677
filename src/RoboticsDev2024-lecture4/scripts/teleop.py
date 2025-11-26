@@ -4,9 +4,10 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
-from r_interfaces.srv import Controller
+from r_interfaces.srv import Controller, Scheduler
 import sys, select, termios, tty
 import threading
+import time
 
 msg = """
 ---------------------------
@@ -35,7 +36,7 @@ Enter coordinates for IK mode:
 CTRL-C to quit
 ---------------------------
 Current Mode: IDLE
-Current Speed: 0.80 m/s
+Current Speed: 0.50 m/s
 """
 
 
@@ -44,13 +45,29 @@ class TeleopJogKeyboard(Node):
         super().__init__("teleop_jog_keyboard")
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+
+        # Client for scheduler (for mode changes)
+        self.scheduler_client = self.create_client(Scheduler, "robot_state_server")
+        while not self.scheduler_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("Waiting for 'robot_state_server' service...")
+
+        # Client for controller (for IK target positions)
         self.controller_client = self.create_client(Controller, "controller_server")
         while not self.controller_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info("Waiting for 'controller_server' service...")
 
-        self.linear_speed = 0.8  # m/s
-        self.speed_increment = 0.01
+        # Subscribe to current state from scheduler
+        self.create_subscription(String, "/current_state", self.state_callback, 10)
+
+        self.linear_speed = 0.5  # m/s
+        self.speed_increment = 0.1
         self.current_mode = "IDLE"
+
+        # Current velocity command
+        self.current_twist = Twist()
+        self.last_key_time = 0.0
+        self.key_timeout = 0.15  # Stop if no key pressed for 150ms
+
         self.movement_keys = {
             "w": (1, 0, 0),  # +x
             "s": (-1, 0, 0),  # -x
@@ -70,6 +87,9 @@ class TeleopJogKeyboard(Node):
 
         self.settings = termios.tcgetattr(sys.stdin)
 
+        # Timer to continuously publish velocity (50Hz)
+        self.create_timer(0.02, self.publish_velocity_callback)
+
         self.get_logger().info(
             "Teleop Jog Keyboard started. Press keys to control robot."
         )
@@ -78,41 +98,80 @@ class TeleopJogKeyboard(Node):
         self.keyboard_thread = threading.Thread(target=self.keyboard_loop)
         self.keyboard_thread.start()
 
+    def state_callback(self, msg: String):
+        """Sync with scheduler's current state"""
+        if self.current_mode != msg.data:
+            self.current_mode = msg.data
+
+    def publish_velocity_callback(self):
+        """Timer callback to continuously publish velocity"""
+        if self.current_mode not in ["TELEOP_G", "TELEOP_F"]:
+            return
+
+        # Check if key timed out (no key pressed recently)
+        if time.time() - self.last_key_time > self.key_timeout:
+            # Stop movement
+            if (
+                self.current_twist.linear.x != 0.0
+                or self.current_twist.linear.y != 0.0
+                or self.current_twist.linear.z != 0.0
+            ):
+                self.current_twist = Twist()
+
+        # Always publish current velocity (either movement or zero)
+        self.cmd_vel_pub.publish(self.current_twist)
+
     def get_key(self):
-        """Get keyboard input"""
+        """Get keyboard input with timeout"""
         tty.setraw(sys.stdin.fileno())
-        select.select([sys.stdin], [], [], 0)
-        key = sys.stdin.read(1)
+        rlist, _, _ = select.select([sys.stdin], [], [], 0.05)  # 50ms timeout
+        if rlist:
+            key = sys.stdin.read(1)
+        else:
+            key = ""
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.settings)
         return key
 
-    def send_controller_mode(self, mode, position=None):
-        """Send mode change request to controller"""
+    def send_scheduler_mode(self, mode):
+        """Send mode change request to scheduler"""
+        request = Scheduler.Request()
+        request.state.data = mode
+        future = self.scheduler_client.call_async(request)
+        future.add_done_callback(self.scheduler_response_callback)
+
+    def scheduler_response_callback(self, future):
+        """Handle scheduler response"""
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(
+                    f"Mode changed successfully to {self.current_mode}"
+                )
+            else:
+                self.get_logger().warning(
+                    f"Mode change to {self.current_mode} failed (invalid transition)"
+                )
+        except Exception as e:
+            self.get_logger().error(f"Scheduler service call failed: {e}")
+
+    def send_ik_target(self, position):
+        """Send IK target position to controller"""
         request = Controller.Request()
-        request.mode.data = mode
-
-        if position:
-            request.position.x = position[0]
-            request.position.y = position[1]
-            request.position.z = position[2]
-        else:
-            request.position.x = 0.0
-            request.position.y = 0.0
-            request.position.z = 0.0
-
+        request.mode.data = "IK"
+        request.position.x = position[0]
+        request.position.y = position[1]
+        request.position.z = position[2]
         future = self.controller_client.call_async(request)
         future.add_done_callback(self.controller_response_callback)
 
     def controller_response_callback(self, future):
-        """Handle controller response"""
+        """Handle controller response for IK"""
         try:
             response = future.result()
             if response.inprogress:
-                self.get_logger().info(
-                    f"Controller mode changed successfully to {self.current_mode}"
-                )
+                self.get_logger().info("IK target accepted")
             else:
-                self.get_logger().warning(f"Controller mode change failed")
+                self.get_logger().warning("IK target rejected (unreachable or unsafe)")
         except Exception as e:
             self.get_logger().error(f"Controller service call failed: {e}")
 
@@ -128,25 +187,6 @@ class TeleopJogKeyboard(Node):
             print("Invalid input! Using default position (0.3, 0.0, 0.3)")
             return [0.3, 0.0, 0.3]
 
-    def get_auto_target(self):
-        """Generate random target for AUTO mode"""
-        import random
-        import numpy as np
-
-        r_max = 0.53
-        r_min = 0.03
-        l = 0.2
-
-        while True:
-            x = random.uniform(-r_max, r_max)
-            y = random.uniform(-r_max, r_max)
-            z = random.uniform(0, r_max + l)
-
-            distance_squared = x**2 + y**2 + (z - l) ** 2
-
-            if r_min**2 < distance_squared < r_max**2:
-                return [x, y, z]
-
     def keyboard_loop(self):
         """Main keyboard control loop"""
         try:
@@ -156,72 +196,75 @@ class TeleopJogKeyboard(Node):
                 if key == "\x03":  # Ctrl-C
                     self.running = False
                     break
+
+                if key == "":
+                    continue  # No key pressed, continue loop
+
+                # Mode change keys
                 if key in self.mode_keys:
                     new_mode = self.mode_keys[key]
-                    self.current_mode = new_mode
+
+                    # Stop any current movement
+                    self.current_twist = Twist()
 
                     if new_mode == "IK":
+                        self.send_scheduler_mode(new_mode)
+                        self.current_mode = new_mode
                         target = self.get_ik_target()
-                        self.send_controller_mode(new_mode, target)
+                        self.send_ik_target(target)
                         print(
                             f"\nMode: {new_mode} - Target: ({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})"
                         )
+
                     elif new_mode == "AUTO":
-                        target = self.get_auto_target()
-                        self.send_controller_mode(new_mode, target)
+                        self.send_scheduler_mode(new_mode)
+                        self.current_mode = new_mode
                         print(
-                            f"\nMode: {new_mode} - Random Target: ({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})"
+                            f"\nMode changed to: {new_mode} (scheduler will generate targets)"
                         )
+
                     else:
-                        self.send_controller_mode(new_mode)
+                        self.send_scheduler_mode(new_mode)
+                        self.current_mode = new_mode
                         print(f"\nMode changed to: {new_mode}")
 
+                # Movement keys (only in TELEOP modes)
                 elif key in self.movement_keys and self.current_mode in [
                     "TELEOP_G",
                     "TELEOP_F",
                 ]:
-                    twist = Twist()
                     direction = self.movement_keys[key]
-                    twist.linear.x = self.linear_speed * direction[0]
-                    twist.linear.y = self.linear_speed * direction[1]
-                    twist.linear.z = self.linear_speed * direction[2]
-                    self.cmd_vel_pub.publish(twist)
+                    self.current_twist.linear.x = self.linear_speed * direction[0]
+                    self.current_twist.linear.y = self.linear_speed * direction[1]
+                    self.current_twist.linear.z = self.linear_speed * direction[2]
+                    self.last_key_time = time.time()
 
                 # Speed control
                 elif key == "t":
-                    self.linear_speed = min(
-                        0.5, self.linear_speed + self.speed_increment
-                    )
+                    self.linear_speed = min(2.0, self.linear_speed * 1.1)
                     print(f"Linear speed: {self.linear_speed:.2f} m/s")
                 elif key == "g":
-                    self.linear_speed = max(
-                        0.01, self.linear_speed - self.speed_increment
-                    )
+                    self.linear_speed = max(0.01, self.linear_speed * 0.9)
                     print(f"Linear speed: {self.linear_speed:.2f} m/s")
 
-                # Input IK coordinates
+                # Input IK coordinates (shortcut)
                 elif key == "i":
+                    self.current_twist = Twist()  # Stop movement
                     if self.current_mode != "IK":
+                        self.send_scheduler_mode("IK")
                         self.current_mode = "IK"
                     target = self.get_ik_target()
-                    self.send_controller_mode("IK", target)
+                    self.send_ik_target(target)
                     print(
                         f"\nIK Mode - Target: ({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})"
                     )
-
-                # Stop movement when key is released in TELEOP modes
-                if self.current_mode in ["TELEOP_G", "TELEOP_F"]:
-                    # Send zero velocity after a short delay if no new key is pressed
-                    if not select.select([sys.stdin], [], [], 0)[0]:
-                        twist = Twist()
-                        self.cmd_vel_pub.publish(twist)
 
         except Exception as e:
             self.get_logger().error(f"Keyboard loop error: {e}")
         finally:
             # Stop robot on exit
-            twist = Twist()
-            self.cmd_vel_pub.publish(twist)
+            self.current_twist = Twist()
+            self.cmd_vel_pub.publish(self.current_twist)
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.settings)
 
     def destroy_node(self):

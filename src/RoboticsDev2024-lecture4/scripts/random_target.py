@@ -2,11 +2,9 @@
 
 import rclpy
 from rclpy.node import Node
-
-# --- [จุดที่แก้สำคัญมาก] ---
-from std_msgs.msg import Header  # <--- Header ต้องมาจาก std_msgs
-from geometry_msgs.msg import PoseStamped  # <--- PoseStamped มาจาก geometry_msgs
-from r_interfaces.srv import Random  # <--- Interface ของคุณ
+from std_msgs.msg import Header  
+from geometry_msgs.msg import PoseStamped  
+from r_interfaces.srv import Random  
 
 # Logic imports
 import random
@@ -18,7 +16,7 @@ from math import pi
 
 class RandomServiceNode(Node):
     def __init__(self):
-        super().__init__("random_node")  # ชื่อ Node ที่จะโชว์ใน list
+        super().__init__("random_node")  
 
         self.srv = self.create_service(Random, "random_pose", self.random_callback)
         self.target_pub = self.create_publisher(PoseStamped, "/target", 10)
@@ -27,8 +25,8 @@ class RandomServiceNode(Node):
         self.robot = rtb.DHRobot(
             [
                 rtb.RevoluteMDH(alpha=0.0, a=0.0, d=0.2, offset=0.0),
-                rtb.RevoluteMDH(alpha=pi / 2, a=0.0, d=-0.12, offset=0.0),
-                rtb.RevoluteMDH(alpha=0, a=0.25, d=-0.1, offset=0.0),
+                rtb.RevoluteMDH(alpha=pi / 2, a=0.0, d=0.02, offset=0.0),
+                rtb.RevoluteMDH(alpha=0, a=0.25, d=0.0, offset=0.0),
             ],
             tool=SE3.Tx(0.28),
             name="RRR_Robot",
@@ -66,7 +64,7 @@ class RandomServiceNode(Node):
 
         # --- PUBLISH TARGET ---
         msg = PoseStamped()
-        msg.header = Header()  # ใช้ Header ที่ถูกต้อง
+        msg.header = Header() 
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "link_0"
         msg.pose.position.x = float(x)
